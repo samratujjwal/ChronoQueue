@@ -1,9 +1,15 @@
 import Fastify from "fastify";
+import { config } from "./config/env.js";
+import { registerErrorHandler } from "./plugins/error-handler.js";
 
 export function buildApp() {
   const app = Fastify({
-    logger: true,
+    logger: {
+      level: config.LOG_LEVEL,
+    },
   });
+
+  registerErrorHandler(app);
 
   app.get("/health", async () => {
     return {
