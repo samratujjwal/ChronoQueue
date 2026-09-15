@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { config } from "./config/env.js";
 import { registerErrorHandler } from "./plugins/error-handler.js";
+import { registerJobRoutes } from "./routes/jobs.js";
 
 export function buildApp() {
   const app = Fastify({
@@ -10,6 +11,7 @@ export function buildApp() {
   });
 
   registerErrorHandler(app);
+  registerJobRoutes(app);
 
   app.get("/health", async () => {
     return {
