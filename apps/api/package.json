@@ -11,15 +11,18 @@
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
-"db:migrate": "drizzle-kit migrate"
+    "db:migrate": "drizzle-kit migrate",
+    "test": "vitest run"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "bullmq": "^6.3.6",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "fastify": "^5.12.4",
+    "ioredis": "^6.0.0",
     "pg": "^8.23.0",
     "zod": "^4.6.5"
   },
@@ -29,6 +32,6 @@
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2",
-     "vitest": "^5.0.1"
+    "vitest": "^5.0.1"
   }
 }

@@ -18,6 +18,13 @@ const envSchema = z.object({
         value.startsWith("postgres://") || value.startsWith("postgresql://"),
       { message: "DATABASE_URL must start with postgres:// or postgresql://" },
     ),
+  REDIS_URL: z
+    .string()
+    .url()
+    .refine(
+      (value) => value.startsWith("redis://") || value.startsWith("rediss://"),
+      { message: "REDIS_URL must start with redis:// or rediss://" },
+    ),
 });
 
 function loadConfig() {
