@@ -1,17 +1,15 @@
 {
-  "name": "@chronoqueue/api",
+  "name": "@chronoqueue/worker",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "dist/index.js",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "start": "node dist/server.js",
+    "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
     "test": "vitest run"
   },
   "keywords": [],
@@ -22,15 +20,14 @@
     "bullmq": "^6.3.6",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
-    "fastify": "^5.12.4",
     "ioredis": "^6.0.0",
     "pg": "^8.23.0",
+    "pino": "^10.3.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/node": "^26.5.1",
     "@types/pg": "^8.23.1",
-    "drizzle-kit": "^0.31.10",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"

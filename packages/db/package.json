@@ -1,0 +1,19 @@
+{
+  "name": "@chronoqueue/db",
+  "version": "1.0.0",
+  "description": "Shared Drizzle schema for the jobs table — the single source of truth for the PostgreSQL business data model, consumed by both apps/api and apps/worker.",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.2"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

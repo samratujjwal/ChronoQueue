@@ -1,7 +1,8 @@
 import type { FastifyError, FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db/client.js";
-import { jobs } from "../db/schema/jobs.js";
+// import { jobs } from "../db/schema/jobs.js";
+import { jobs } from "@chronoqueue/db";
 
 const createJobBodySchema = z.object({
   type: z.literal("WEBHOOK"),

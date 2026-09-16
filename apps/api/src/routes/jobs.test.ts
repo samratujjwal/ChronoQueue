@@ -1,7 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { buildApp } from "../app.js";
 import { db } from "../db/client.js";
-import { jobs } from "../db/schema/jobs.js";
+// import { jobs } from "../db/schema/jobs.js";
+import { jobs } from "@chronoqueue/db";
 import { eq } from "drizzle-orm";
 
 const app = buildApp();

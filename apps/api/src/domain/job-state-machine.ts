@@ -1,4 +1,5 @@
-import { jobStatusEnum } from "../db/schema/jobs.js";
+import { jobStatusEnum } from "@chronoqueue/db";
+// import { jobStatusEnum } from "../db/schema/jobs.js";
 
 export type JobStatus = (typeof jobStatusEnum.enumValues)[number];
 
