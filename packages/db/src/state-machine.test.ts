@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isValidTransition, type JobStatus } from "./job-state-machine.js";
+import { isValidTransition, type JobStatus } from "./state-machine.js";
 
 describe("job state machine", () => {
   const validTransitions: Array<[JobStatus, JobStatus]> = [
@@ -7,6 +7,7 @@ describe("job state machine", () => {
     ["QUEUED", "PROCESSING"],
     ["PROCESSING", "SUCCEEDED"],
     ["PROCESSING", "RETRYING"],
+    ["PROCESSING", "DEAD"],
     ["RETRYING", "QUEUED"],
     ["RETRYING", "DEAD"],
   ];
@@ -21,7 +22,6 @@ describe("job state machine", () => {
     ["QUEUED", "SUCCEEDED"],
     ["QUEUED", "RETRYING"],
     ["PROCESSING", "QUEUED"],
-    ["PROCESSING", "DEAD"],
     ["SUCCEEDED", "PROCESSING"],
     ["SUCCEEDED", "PENDING"],
     ["DEAD", "PROCESSING"],

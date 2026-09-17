@@ -116,6 +116,30 @@ function startCapturingServer(
   });
 }
 
+async function insertPendingJob(options: {
+  port: number;
+  maxAttempts?: number;
+  nextAttemptAt?: Date;
+}): Promise<string> {
+  const id = randomUUID();
+  insertedPostgresIds.push(id);
+  await db.insert(jobs).values({
+    id,
+    type: "WEBHOOK",
+    status: "PENDING",
+    targetUrl: `http://127.0.0.1:${options.port}/webhook`,
+    payload: { test: true },
+    ...(options.maxAttempts ? { maxAttempts: options.maxAttempts } : {}),
+    ...(options.nextAttemptAt ? { nextAttemptAt: options.nextAttemptAt } : {}),
+  });
+  return id;
+}
+
+async function fetchJob(id: string) {
+  const [row] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+  return row;
+}
+
 describe("worker: processWebhookDeliveryJob (real Redis + real PostgreSQL + real HTTP)", () => {
   it("delivers the webhook over real HTTP and completes the BullMQ job", async () => {
     let captured: CapturedRequest | undefined;
@@ -195,7 +219,6 @@ describe("worker: processWebhookDeliveryJob (real Redis + real PostgreSQL + real
       let requestReceived = false;
 
       const { server, port } = await startCapturingServer((_req, _res) => {
-        requestReceived = true;
         // Intentionally never call res.end() — simulates a hanging endpoint.
       });
       serversToClose.push(server);
@@ -245,5 +268,195 @@ describe("worker: processWebhookDeliveryJob (real Redis + real PostgreSQL + real
     const result = await outcome;
     expect(result.status).toBe("failed");
     expect(result.error?.message).toContain(missingPostgresJobId);
+  });
+});
+
+describe("worker: retry engine (real PostgreSQL state transitions)", () => {
+  it("HTTP 500 is retryable: attempts increments, status becomes RETRYING", async () => {
+    const { server, port } = await startCapturingServer((_req, res) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end();
+    });
+    serversToClose.push(server);
+
+    const id = await insertPendingJob({ port });
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+    await outcome;
+
+    const row = await fetchJob(id);
+    expect(row.status).toBe("RETRYING");
+    expect(row.attempts).toBe(1);
+    expect(row.nextAttemptAt).not.toBeNull();
+  });
+
+  it("HTTP 503 is retryable: attempts increments, status becomes RETRYING", async () => {
+    const { server, port } = await startCapturingServer((_req, res) => {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end();
+    });
+    serversToClose.push(server);
+
+    const id = await insertPendingJob({ port });
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+    await outcome;
+
+    const row = await fetchJob(id);
+    expect(row.status).toBe("RETRYING");
+    expect(row.attempts).toBe(1);
+  });
+
+  it("network/transport failure is retryable: attempts increments, status becomes RETRYING", async () => {
+    const id = randomUUID();
+    insertedPostgresIds.push(id);
+    await db.insert(jobs).values({
+      id,
+      type: "WEBHOOK",
+      status: "PENDING",
+      targetUrl: "http://127.0.0.1:1/unreachable",
+      payload: { test: true },
+    });
+
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+    await outcome;
+
+    const row = await fetchJob(id);
+    expect(row.status).toBe("RETRYING");
+    expect(row.attempts).toBe(1);
+  });
+
+  it(
+    "timeout is retryable: attempts increments, status becomes RETRYING",
+    async () => {
+      const { server, port } = await startCapturingServer((_req, _res) => {
+        // Intentionally never respond.
+      });
+      serversToClose.push(server);
+
+      const id = await insertPendingJob({ port });
+      const outcome = waitForJobOutcome(id);
+      await queue.add(
+        "deliver-webhook",
+        { jobId: id },
+        { jobId: id, removeOnComplete: true, removeOnFail: true },
+      );
+      await outcome;
+
+      const row = await fetchJob(id);
+      expect(row.status).toBe("RETRYING");
+      expect(row.attempts).toBe(1);
+    },
+    WEBHOOK_TIMEOUT_MS + 10_000,
+  );
+
+  it("HTTP 400 is non-retryable: attempts increments, status becomes DEAD", async () => {
+    const { server, port } = await startCapturingServer((_req, res) => {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end();
+    });
+    serversToClose.push(server);
+
+    const id = await insertPendingJob({
+      port,
+      nextAttemptAt: new Date(Date.now() + 60_000),
+    });
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+    await outcome;
+
+    const row = await fetchJob(id);
+    expect(row.status).toBe("DEAD");
+    expect(row.attempts).toBe(1);
+    expect(row.nextAttemptAt).toBeNull();
+  });
+
+  it("HTTP 404 is non-retryable: attempts increments, status becomes DEAD", async () => {
+    const { server, port } = await startCapturingServer((_req, res) => {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end();
+    });
+    serversToClose.push(server);
+
+    const id = await insertPendingJob({ port });
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+    await outcome;
+
+    const row = await fetchJob(id);
+    expect(row.status).toBe("DEAD");
+    expect(row.attempts).toBe(1);
+  });
+
+  it("retryable failure on the final allowed attempt marks the job DEAD (max attempts reached)", async () => {
+    const { server, port } = await startCapturingServer((_req, res) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end();
+    });
+    serversToClose.push(server);
+
+    const id = await insertPendingJob({
+      port,
+      maxAttempts: 1,
+      nextAttemptAt: new Date(Date.now() + 60_000),
+    });
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+    await outcome;
+
+    const row = await fetchJob(id);
+    expect(row.status).toBe("DEAD");
+    expect(row.attempts).toBe(1);
+    expect(row.nextAttemptAt).toBeNull();
+  });
+
+  it("successful 2xx increments attempts exactly once and marks the job SUCCEEDED", async () => {
+    const { server, port } = await startCapturingServer((_req, res) => {
+      res.writeHead(202, { "Content-Type": "application/json" });
+      res.end();
+    });
+    serversToClose.push(server);
+
+    const id = await insertPendingJob({
+      port,
+      nextAttemptAt: new Date(Date.now() + 60_000),
+    });
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+    await outcome;
+
+    const row = await fetchJob(id);
+    expect(row.status).toBe("SUCCEEDED");
+    expect(row.attempts).toBe(1);
+    expect(row.nextAttemptAt).toBeNull();
   });
 });

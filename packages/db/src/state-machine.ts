@@ -1,12 +1,11 @@
-import { jobStatusEnum } from "@chronoqueue/db";
-// import { jobStatusEnum } from "../db/schema/jobs.js";
+import { jobStatusEnum } from "./schema/jobs.js";
 
 export type JobStatus = (typeof jobStatusEnum.enumValues)[number];
 
 const transitions: Record<JobStatus, readonly JobStatus[]> = {
   PENDING: ["QUEUED"],
   QUEUED: ["PROCESSING"],
-  PROCESSING: ["SUCCEEDED", "RETRYING"],
+  PROCESSING: ["SUCCEEDED", "RETRYING", "DEAD"],
   RETRYING: ["QUEUED", "DEAD"],
   SUCCEEDED: [],
   DEAD: [],
