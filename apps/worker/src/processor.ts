@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { jobs } from "@chronoqueue/db";
 import { db } from "./db/client.js";
 import { logger } from "./logger.js";
+import { deliverWebhook } from "./webhook-delivery.js";
 
 export interface WebhookDeliveryJobData {
   jobId: string;
@@ -58,5 +59,39 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
     "loaded postgresql job successfully",
   );
 
-  // Day 7 stops here — no HTTP request, no retries, no status transition yet.
+  const startedAt = Date.now();
+
+  try {
+    const statusCode = await deliverWebhook(
+      businessJob.targetUrl,
+      businessJob.payload,
+    );
+    const durationMs = Date.now() - startedAt;
+
+    logger.info(
+      {
+        bullJobId: job.id,
+        postgresJobId: businessJob.id,
+        targetUrl: businessJob.targetUrl,
+        statusCode,
+        durationMs,
+      },
+      "webhook delivered successfully",
+    );
+  } catch (error) {
+    const durationMs = Date.now() - startedAt;
+
+    logger.error(
+      {
+        bullJobId: job.id,
+        postgresJobId: businessJob.id,
+        targetUrl: businessJob.targetUrl,
+        durationMs,
+        err: error instanceof Error ? error.message : String(error),
+      },
+      "webhook delivery failed",
+    );
+
+    throw error;
+  }
 }
