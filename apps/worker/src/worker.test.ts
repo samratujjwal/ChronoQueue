@@ -219,6 +219,7 @@ describe("worker: processWebhookDeliveryJob (real Redis + real PostgreSQL + real
       let requestReceived = false;
 
       const { server, port } = await startCapturingServer((_req, _res) => {
+        requestReceived = true;
         // Intentionally never call res.end() — simulates a hanging endpoint.
       });
       serversToClose.push(server);
