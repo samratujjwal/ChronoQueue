@@ -23,6 +23,8 @@ const envSchema = z.object({
       (value) => value.startsWith("redis://") || value.startsWith("rediss://"),
       { message: "REDIS_URL must start with redis:// or rediss://" },
     ),
+  RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(1000),
+  RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(30000),
 });
 
 function loadConfig() {

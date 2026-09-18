@@ -4,6 +4,11 @@ import { jobs, isValidTransition, type JobStatus } from "@chronoqueue/db";
 import { db } from "./db/client.js";
 import { logger } from "./logger.js";
 import { deliverWebhook, WebhookDeliveryError } from "./webhook-delivery.js";
+import {
+  applyFullJitter,
+  calculateExponentialDelayMs,
+} from "./retry-policy.js";
+import { config } from "./config/env.js";
 
 export interface WebhookDeliveryJobData {
   jobId: string;
@@ -127,13 +132,26 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
     const willRetry = retryable && attempts < claimed.maxAttempts;
     const nextStatus: JobStatus = willRetry ? "RETRYING" : "DEAD";
 
+    let nextAttemptAt: Date | null = null;
+    let exponentialDelayMs: number | undefined;
+    let jitteredDelayMs: number | undefined;
+
+    if (willRetry) {
+      exponentialDelayMs = calculateExponentialDelayMs(attempts, {
+        baseDelayMs: config.RETRY_BASE_DELAY_MS,
+        maxDelayMs: config.RETRY_MAX_DELAY_MS,
+      });
+      jitteredDelayMs = applyFullJitter(exponentialDelayMs);
+      nextAttemptAt = new Date(Date.now() + jitteredDelayMs);
+    }
+
     if (isValidTransition("PROCESSING", nextStatus)) {
       await db
         .update(jobs)
         .set({
           status: nextStatus,
           attempts,
-          nextAttemptAt: willRetry ? new Date() : null,
+          nextAttemptAt,
           updatedAt: new Date(),
         })
         .where(and(eq(jobs.id, jobId), eq(jobs.status, "PROCESSING")));
@@ -155,6 +173,9 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
         retryable,
         statusCode,
         nextStatus,
+        exponentialDelayMs,
+        jitteredDelayMs,
+        nextAttemptAt,
         err: error instanceof Error ? error.message : String(error),
       },
       nextStatus === "RETRYING"
