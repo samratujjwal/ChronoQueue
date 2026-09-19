@@ -26,6 +26,7 @@ export const jobs = pgTable(
   "jobs",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    idempotencyKey: text("idempotency_key").notNull().unique(),
     type: jobTypeEnum("type").notNull(),
     status: jobStatusEnum("status").notNull().default("PENDING"),
     targetUrl: text("target_url").notNull(),

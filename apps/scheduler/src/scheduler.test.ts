@@ -31,6 +31,7 @@ async function insertPendingJob(scheduledAt: Date): Promise<string> {
   insertedIds.push(id);
   await db.insert(jobs).values({
     id,
+    idempotencyKey: randomUUID(),
     type: "WEBHOOK",
     status: "PENDING",
     targetUrl: "http://127.0.0.1:9/unused",
@@ -45,6 +46,7 @@ async function insertRetryingJob(nextAttemptAt: Date): Promise<string> {
   insertedIds.push(id);
   await db.insert(jobs).values({
     id,
+    idempotencyKey: randomUUID(),
     type: "WEBHOOK",
     status: "RETRYING",
     targetUrl: "http://127.0.0.1:9/unused",

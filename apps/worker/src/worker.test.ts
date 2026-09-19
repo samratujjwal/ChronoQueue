@@ -125,6 +125,7 @@ async function insertPendingJob(options: {
   insertedPostgresIds.push(id);
   await db.insert(jobs).values({
     id,
+    idempotencyKey: randomUUID(),
     type: "WEBHOOK",
     status: "PENDING",
     targetUrl: `http://127.0.0.1:${options.port}/webhook`,
@@ -157,6 +158,7 @@ describe("worker: processWebhookDeliveryJob (real Redis + real PostgreSQL + real
 
     await db.insert(jobs).values({
       id: postgresJobId,
+      idempotencyKey: randomUUID(),
       type: "WEBHOOK",
       status: "PENDING",
       targetUrl: `http://127.0.0.1:${port}/webhook`,
@@ -193,6 +195,7 @@ describe("worker: processWebhookDeliveryJob (real Redis + real PostgreSQL + real
 
     await db.insert(jobs).values({
       id: postgresJobId,
+      idempotencyKey: randomUUID(),
       type: "WEBHOOK",
       status: "PENDING",
       targetUrl: `http://127.0.0.1:${port}/webhook`,
@@ -229,6 +232,7 @@ describe("worker: processWebhookDeliveryJob (real Redis + real PostgreSQL + real
 
       await db.insert(jobs).values({
         id: postgresJobId,
+        idempotencyKey: randomUUID(),
         type: "WEBHOOK",
         status: "PENDING",
         targetUrl: `http://127.0.0.1:${port}/webhook`,
@@ -321,6 +325,7 @@ describe("worker: retry engine (real PostgreSQL state transitions)", () => {
     insertedPostgresIds.push(id);
     await db.insert(jobs).values({
       id,
+      idempotencyKey: randomUUID(),
       type: "WEBHOOK",
       status: "PENDING",
       targetUrl: "http://127.0.0.1:1/unreachable",
@@ -459,5 +464,67 @@ describe("worker: retry engine (real PostgreSQL state transitions)", () => {
     expect(row.status).toBe("SUCCEEDED");
     expect(row.attempts).toBe(1);
     expect(row.nextAttemptAt).toBeNull();
+  });
+});
+
+describe("worker: concurrency safety (real PostgreSQL claim guard)", () => {
+  it("only one of two concurrent processing attempts for the same job reaches webhook execution", async () => {
+    let hitCount = 0;
+
+    const { server, port } = await startCapturingServer((_req, res) => {
+      hitCount += 1;
+      res.writeHead(202, { "Content-Type": "application/json" });
+      res.end();
+    });
+    serversToClose.push(server);
+
+    const id = randomUUID();
+    insertedPostgresIds.push(id);
+    await db.insert(jobs).values({
+      id,
+      idempotencyKey: randomUUID(),
+      type: "WEBHOOK",
+      status: "PENDING",
+      targetUrl: `http://127.0.0.1:${port}/webhook`,
+      payload: { test: true },
+    });
+
+    // Two logical processing attempts referencing the SAME PostgreSQL job
+    // (e.g. a duplicate/replayed BullMQ delivery). BullMQ itself already
+    // guarantees a single job id is only dispatched to one worker at a
+    // time, so calling the processor directly with two distinct fake
+    // BullMQ Job objects is what actually exercises the invariant Day 12
+    // cares about: the PostgreSQL claim guard, not BullMQ's own dispatch.
+    const fakeJobA = {
+      id: "concurrency-test-a",
+      data: { jobId: id },
+    } as unknown as Job;
+    const fakeJobB = {
+      id: "concurrency-test-b",
+      data: { jobId: id },
+    } as unknown as Job;
+
+    const [resultA, resultB] = await Promise.allSettled([
+      processWebhookDeliveryJob(fakeJobA),
+      processWebhookDeliveryJob(fakeJobB),
+    ]);
+
+    const outcomes = [resultA, resultB];
+    const fulfilled = outcomes.filter((r) => r.status === "fulfilled");
+    const rejected = outcomes.filter((r) => r.status === "rejected");
+
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason.message).toContain(
+      "could not be claimed",
+    );
+
+    // The critical assertion: the losing attempt must never have reached
+    // deliverWebhook — the local server should have been hit exactly once.
+    expect(hitCount).toBe(1);
+
+    const row = await fetchJob(id);
+    expect(row.status).toBe("SUCCEEDED");
+    expect(row.attempts).toBe(1);
   });
 });
