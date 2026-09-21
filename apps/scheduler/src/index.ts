@@ -1,6 +1,7 @@
 import { logger } from "./logger.js";
 import { config } from "./config/env.js";
 import { runSchedulerPoll } from "./scheduler.js";
+import { recoverStaleJobs } from "./recovery.js";
 import { connection } from "./queue/connection.js";
 import { webhookQueue } from "./queue/webhook-queue.js";
 import { pool } from "./db/client.js";
@@ -12,16 +13,29 @@ function sleep(ms: number): Promise<void> {
 let shuttingDown = false;
 let currentPollPromise: Promise<void> | null = null;
 
+async function runCycle(): Promise<void> {
+  try {
+    await recoverStaleJobs();
+  } catch (error) {
+    logger.error(
+      { err: error instanceof Error ? error.message : String(error) },
+      "stale job recovery failed",
+    );
+  }
+
+  try {
+    await runSchedulerPoll();
+  } catch (error) {
+    logger.error(
+      { err: error instanceof Error ? error.message : String(error) },
+      "scheduler poll failed",
+    );
+  }
+}
+
 async function loop(): Promise<void> {
   while (!shuttingDown) {
-    currentPollPromise = runSchedulerPoll()
-      .then(() => undefined)
-      .catch((error) => {
-        logger.error(
-          { err: error instanceof Error ? error.message : String(error) },
-          "scheduler poll failed",
-        );
-      });
+    currentPollPromise = runCycle();
 
     await currentPollPromise;
     currentPollPromise = null;

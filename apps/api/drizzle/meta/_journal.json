@@ -15,6 +15,27 @@
       "when": 1789784206188,
       "tag": "0001_certain_odin",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789874112842,
+      "tag": "0002_superb_vanisher",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789932301520,
+      "tag": "0003_tearful_richard_fisk",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789986026500,
+      "tag": "0004_cloudy_invaders",
+      "breakpoints": true
     }
   ]
 }

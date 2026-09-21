@@ -25,6 +25,12 @@ const envSchema = z.object({
     ),
   RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(1000),
   RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(30000),
+  WORKER_LEASE_DURATION_MS: z.coerce.number().int().positive().default(30_000),
+  WORKER_LEASE_RENEWAL_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(10_000),
 });
 
 function loadConfig() {

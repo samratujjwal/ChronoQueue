@@ -25,6 +25,8 @@ const envSchema = z.object({
     ),
   SCHEDULER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1000),
   SCHEDULER_BATCH_SIZE: z.coerce.number().int().positive().default(100),
+  RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(1000),
+  RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(30000),
 });
 
 function loadConfig() {

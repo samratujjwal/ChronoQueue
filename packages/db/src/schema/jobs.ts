@@ -37,6 +37,8 @@ export const jobs = pgTable(
       .notNull()
       .defaultNow(),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    leaseToken: text("lease_token"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

@@ -13,6 +13,7 @@ import { connection } from "./queue/connection.js";
 import { db, pool } from "./db/client.js";
 import { processWebhookDeliveryJob } from "./processor.js";
 import { WEBHOOK_TIMEOUT_MS } from "./webhook-delivery.js";
+import { claimJob, renewLease, completeProcessing } from "./lease.js";
 
 const queue = new Queue("webhook-delivery", { connection });
 const testWorker = new Worker("webhook-delivery", processWebhookDeliveryJob, {
@@ -297,6 +298,7 @@ describe("worker: retry engine (real PostgreSQL state transitions)", () => {
     expect(row.status).toBe("RETRYING");
     expect(row.attempts).toBe(1);
     expect(row.nextAttemptAt).not.toBeNull();
+    expect(row.leaseUntil).toBeNull();
   });
 
   it("HTTP 503 is retryable: attempts increments, status becomes RETRYING", async () => {
@@ -392,6 +394,7 @@ describe("worker: retry engine (real PostgreSQL state transitions)", () => {
     expect(row.status).toBe("DEAD");
     expect(row.attempts).toBe(1);
     expect(row.nextAttemptAt).toBeNull();
+    expect(row.leaseUntil).toBeNull();
   });
 
   it("HTTP 404 is non-retryable: attempts increments, status becomes DEAD", async () => {
@@ -464,6 +467,7 @@ describe("worker: retry engine (real PostgreSQL state transitions)", () => {
     expect(row.status).toBe("SUCCEEDED");
     expect(row.attempts).toBe(1);
     expect(row.nextAttemptAt).toBeNull();
+    expect(row.leaseUntil).toBeNull();
   });
 });
 
@@ -526,5 +530,164 @@ describe("worker: concurrency safety (real PostgreSQL claim guard)", () => {
     const row = await fetchJob(id);
     expect(row.status).toBe("SUCCEEDED");
     expect(row.attempts).toBe(1);
+  });
+});
+
+describe("worker: lease (real PostgreSQL)", () => {
+  it("claim sets leaseUntil to a future timestamp", async () => {
+    const { server, port } = await startCapturingServer((_req, res) => {
+      setTimeout(() => {
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end();
+      }, 300);
+    });
+    serversToClose.push(server);
+
+    const id = await insertPendingJob({ port });
+
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+
+    // Peek mid-flight, before the response is sent — claim should have
+    // already set a future leaseUntil.
+    await new Promise((r) => setTimeout(r, 100));
+    const midFlight = await fetchJob(id);
+    expect(midFlight.status).toBe("PROCESSING");
+    expect(midFlight.leaseUntil).not.toBeNull();
+    expect(midFlight.leaseUntil!.getTime()).toBeGreaterThan(Date.now());
+
+    await outcome;
+  });
+
+  it("renews the lease while processing is still in progress", async () => {
+    const { server, port } = await startCapturingServer((_req, res) => {
+      setTimeout(() => {
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end();
+      }, 900);
+    });
+    serversToClose.push(server);
+
+    const id = await insertPendingJob({ port });
+
+    const outcome = waitForJobOutcome(id);
+    await queue.add(
+      "deliver-webhook",
+      { jobId: id },
+      { jobId: id, removeOnComplete: true, removeOnFail: true },
+    );
+
+    await new Promise((r) => setTimeout(r, 150));
+    const early = await fetchJob(id);
+    expect(early.status).toBe("PROCESSING");
+    expect(early.leaseUntil).not.toBeNull();
+
+    await new Promise((r) => setTimeout(r, 500));
+    const later = await fetchJob(id);
+    expect(later.status).toBe("PROCESSING");
+    expect(later.leaseUntil).not.toBeNull();
+    // The critical assertion: leaseUntil actually moved forward, proving
+    // renewal happened (not just that claim set it once).
+    expect(later.leaseUntil!.getTime()).toBeGreaterThan(
+      early.leaseUntil!.getTime(),
+    );
+
+    await outcome;
+
+    const final = await fetchJob(id);
+    expect(final.status).toBe("SUCCEEDED");
+    expect(final.leaseUntil).toBeNull();
+  });
+});
+
+describe("worker: lease fencing (stale worker cannot affect a newer processing attempt)", () => {
+  it("a stale worker's token cannot renew, succeed, retry, or dead a newer worker's processing attempt", async () => {
+    const id = randomUUID();
+    insertedPostgresIds.push(id);
+
+    // Simulate: Worker A claimed this job earlier and went stale
+    // (crashed/paused). Scheduler recovery would have already run,
+    // transitioning it to RETRYING and clearing the lease fields —
+    // replicate that end state directly, since this test is Worker-scoped.
+    await db.insert(jobs).values({
+      id,
+      idempotencyKey: randomUUID(),
+      type: "WEBHOOK",
+      status: "RETRYING",
+      targetUrl: "http://127.0.0.1:9/unused",
+      payload: { test: true },
+      leaseUntil: null,
+      leaseToken: null,
+    });
+
+    const staleToken = "stale-token-AAA";
+
+    // Worker B claims it for real, via the actual production claim path.
+    const claimResult = await claimJob(id);
+    expect(claimResult).not.toBeNull();
+    const { leaseToken: tokenB } = claimResult!;
+    expect(tokenB).not.toBe(staleToken);
+
+    // --- Test A: stale renewal must fail, and not touch Worker B's lease ---
+    const staleRenewResult = await renewLease(id, staleToken);
+    expect(staleRenewResult).toBe(false);
+
+    const afterStaleRenew = await fetchJob(id);
+    expect(afterStaleRenew.status).toBe("PROCESSING");
+    expect(afterStaleRenew.leaseToken).toBe(tokenB);
+
+    // --- Test B: stale success must fail, job stays PROCESSING under B ---
+    const staleSucceedResult = await completeProcessing(id, staleToken, {
+      status: "SUCCEEDED",
+      attempts: 99,
+      nextAttemptAt: null,
+    });
+    expect(staleSucceedResult).toBe(false);
+
+    const afterStaleSucceed = await fetchJob(id);
+    expect(afterStaleSucceed.status).toBe("PROCESSING");
+    expect(afterStaleSucceed.leaseToken).toBe(tokenB);
+    expect(afterStaleSucceed.attempts).not.toBe(99);
+
+    // --- Test C: stale retry and stale dead must also both fail ---
+    const staleRetryResult = await completeProcessing(id, staleToken, {
+      status: "RETRYING",
+      attempts: 99,
+      nextAttemptAt: new Date(),
+    });
+    expect(staleRetryResult).toBe(false);
+
+    const staleDeadResult = await completeProcessing(id, staleToken, {
+      status: "DEAD",
+      attempts: 99,
+      nextAttemptAt: null,
+    });
+    expect(staleDeadResult).toBe(false);
+
+    const afterAllStaleAttempts = await fetchJob(id);
+    expect(afterAllStaleAttempts.status).toBe("PROCESSING");
+    expect(afterAllStaleAttempts.leaseToken).toBe(tokenB);
+    expect(afterAllStaleAttempts.attempts).toBe(0);
+
+    // --- Confirm Worker B's OWN token still legitimately works ---
+    const legitRenew = await renewLease(id, tokenB);
+    expect(legitRenew).toBe(true);
+
+    const legitComplete = await completeProcessing(id, tokenB, {
+      status: "SUCCEEDED",
+      attempts: 1,
+      nextAttemptAt: null,
+    });
+    expect(legitComplete).toBe(true);
+
+    const finalRow = await fetchJob(id);
+    expect(finalRow.status).toBe("SUCCEEDED");
+    expect(finalRow.leaseToken).toBeNull();
+    expect(finalRow.leaseUntil).toBeNull();
+    expect(finalRow.attempts).toBe(1);
   });
 });
