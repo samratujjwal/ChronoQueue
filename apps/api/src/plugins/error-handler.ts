@@ -4,6 +4,7 @@ import type {
   FastifyReply,
   FastifyRequest,
 } from "fastify";
+import { safeError } from "@chronoqueue/observability";
 import { config } from "../config/env.js";
 
 interface ErrorResponseBody {
@@ -34,7 +35,18 @@ export function registerErrorHandler(app: FastifyInstance): void {
       const isServerError = statusCode >= 500;
       const isProduction = config.NODE_ENV === "production";
 
-      request.log.error({ err: error, statusCode }, "request failed");
+      // Safe logging: raw Error objects can carry response bodies, headers,
+      // or config snapshots. Log only the stable diagnostic fields plus
+      // the event marker for correlation (PART 4).
+      request.log.error(
+        {
+          event: "request_failed",
+          requestId: request.id,
+          statusCode,
+          ...safeError(error),
+        },
+        "request failed",
+      );
 
       const message =
         isServerError && isProduction ? "Internal Server Error" : error.message;

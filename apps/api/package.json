@@ -25,7 +25,8 @@
     "fastify": "^5.12.4",
     "ioredis": "^6.0.0",
     "pg": "^8.23.0",
-    "zod": "^4.6.5"
+    "zod": "^4.6.5",
+    "@chronoqueue/observability": "*"
   },
   "devDependencies": {
     "@types/node": "^26.5.1",

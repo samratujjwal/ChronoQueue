@@ -1,3 +1,4 @@
+import type { Logger } from "pino";
 import { and, eq, isNotNull, lt } from "drizzle-orm";
 import {
   jobs,
@@ -6,13 +7,29 @@ import {
   applyFullJitter,
   calculateExponentialDelayMs,
 } from "@chronoqueue/db";
+import {
+  SCHEDULER_EVENTS,
+  safeError,
+  safely,
+} from "@chronoqueue/observability";
 import { db } from "./db/client.js";
-import { logger } from "./logger.js";
+import { logger as defaultLogger } from "./logger.js";
+import {
+  schedulerMetrics as defaultSchedulerMetrics,
+  type SchedulerMetrics,
+} from "./observability.js";
 import { config } from "./config/env.js";
 
 export interface RecoveryResult {
   staleCount: number;
   recoveredJobIds: string[];
+}
+
+// Test seam: production passes nothing; tests inject a capture logger and
+// a fresh metrics registry.
+export interface RecoveryDeps {
+  logger?: Logger;
+  schedulerMetrics?: SchedulerMetrics;
 }
 
 // A job is stale when it's still PROCESSING but its lease expired — the
@@ -26,7 +43,12 @@ function staleCondition(now: Date) {
   );
 }
 
-export async function recoverStaleJobs(): Promise<RecoveryResult> {
+export async function recoverStaleJobs(
+  deps: RecoveryDeps = {},
+): Promise<RecoveryResult> {
+  const logger = deps.logger ?? defaultLogger;
+  const metrics = deps.schedulerMetrics ?? defaultSchedulerMetrics;
+
   const staleJobs = await db
     .select({
       id: jobs.id,
@@ -41,7 +63,10 @@ export async function recoverStaleJobs(): Promise<RecoveryResult> {
   }
 
   logger.info(
-    { staleCount: staleJobs.length },
+    {
+      event: SCHEDULER_EVENTS.expiredLeaseRecovered,
+      staleCount: staleJobs.length,
+    },
     "recovery: stale processing jobs found",
   );
 
@@ -60,7 +85,11 @@ export async function recoverStaleJobs(): Promise<RecoveryResult> {
 
       if (!isValidTransition("PROCESSING", nextStatus)) {
         logger.error(
-          { postgresJobId: job.id, nextStatus },
+          {
+            event: SCHEDULER_EVENTS.expiredLeaseRecovered,
+            jobId: job.id,
+            nextStatus,
+          },
           "recovery: illegal transition, skipping job",
         );
         continue;
@@ -104,7 +133,11 @@ export async function recoverStaleJobs(): Promise<RecoveryResult> {
 
       if (!recovered) {
         logger.info(
-          { postgresJobId: job.id },
+          {
+            event: SCHEDULER_EVENTS.expiredLeaseRecovered,
+            recovered: false,
+            jobId: job.id,
+          },
           "recovery: job no longer stale by the time of update, skipping",
         );
         continue;
@@ -112,15 +145,34 @@ export async function recoverStaleJobs(): Promise<RecoveryResult> {
 
       recoveredJobIds.push(job.id);
 
+      // Metrics follow the guarded transition (PART 6): only a successful
+      // PG write counts, labeled by source so dashboards can separate
+      // crash-recoveries from webhook-failure retries/deaths.
+      safely(() => {
+        if (nextStatus === "RETRYING") {
+          metrics.jobsRetriedTotal.inc({ source: "recovery" });
+        } else {
+          metrics.jobsDeadTotal.inc({ source: "recovery" });
+        }
+      });
+
       logger.info(
-        { postgresJobId: job.id, nextStatus, attempts },
+        {
+          event: SCHEDULER_EVENTS.expiredLeaseRecovered,
+          recovered: true,
+          jobId: job.id,
+          nextStatus,
+          attempts,
+          errorCode: "WORKER_CRASH",
+        },
         "recovery: recovered stale processing job",
       );
     } catch (error) {
       logger.error(
         {
-          postgresJobId: job.id,
-          err: error instanceof Error ? error.message : String(error),
+          event: SCHEDULER_EVENTS.expiredLeaseRecovered,
+          jobId: job.id,
+          ...safeError(error),
         },
         "recovery: failed to recover job, continuing with remaining batch",
       );

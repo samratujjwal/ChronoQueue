@@ -11,7 +11,9 @@ import {
   listDeadJobs,
   retriggerDeadJob,
 } from "@chronoqueue/db";
+import { API_EVENTS, safeError, safely } from "@chronoqueue/observability";
 import { enqueueRetriggeredJob } from "../queue/webhook-producer.js";
+import { apiMetrics } from "../observability.js";
 
 const createJobBodySchema = z.object({
   type: z.literal("WEBHOOK"),
@@ -96,6 +98,10 @@ function isIdempotencyKeyConflict(error: unknown): boolean {
   );
 }
 
+// The idempotency key itself is safe to log (it is a client-provided dedup
+// token, never a secret), but its presence is the diagnostic — never its
+// value in a way that could be cross-referenced. We log hasIdempotencyKey
+// only.
 export function registerJobRoutes(app: FastifyInstance): void {
   app.post("/jobs", async (request, reply) => {
     const idempotencyKeyHeader = request.headers["idempotency-key"];
@@ -133,6 +139,18 @@ export function registerJobRoutes(app: FastifyInstance): void {
         })
         .returning(RETURNING_COLUMNS);
 
+      request.log.info(
+        {
+          event: API_EVENTS.jobCreated,
+          jobId: created?.id,
+          requestId: request.id,
+        },
+        "job created",
+      );
+
+      // Metrics follow the successful write (PART 6), not the attempt.
+      safely(() => apiMetrics.jobsCreatedTotal.inc());
+
       reply.status(201).send(created);
     } catch (error) {
       if (!isIdempotencyKeyConflict(error)) {
@@ -153,6 +171,17 @@ export function registerJobRoutes(app: FastifyInstance): void {
         // exists, but guard defensively rather than silently succeeding.
         throw error;
       }
+
+      request.log.info(
+        {
+          event: API_EVENTS.jobCreationIdempotentHit,
+          jobId: existing.id,
+          requestId: request.id,
+        },
+        "idempotent job creation hit",
+      );
+
+      safely(() => apiMetrics.jobCreationIdempotentHitsTotal.inc());
 
       reply.status(200).send(existing);
     }
@@ -182,6 +211,18 @@ export function registerJobRoutes(app: FastifyInstance): void {
     }
 
     const page = await listDeadJobs(db, parsed.data);
+
+    request.log.info(
+      {
+        event: API_EVENTS.deadJobsListed,
+        requestId: request.id,
+        page: parsed.data.page,
+        pageSize: parsed.data.pageSize,
+        total: page.total,
+      },
+      "dead jobs listed",
+    );
+
     reply.status(200).send(page);
   });
 
@@ -197,8 +238,27 @@ export function registerJobRoutes(app: FastifyInstance): void {
     const job = await getJobById(db, parsed.data.id);
 
     if (!job) {
+      request.log.info(
+        {
+          event: API_EVENTS.jobRetrieved,
+          requestId: request.id,
+          jobId: parsed.data.id,
+          found: false,
+        },
+        "job lookup missed",
+      );
       throw notFound(`job ${parsed.data.id} not found`);
     }
+
+    request.log.info(
+      {
+        event: API_EVENTS.jobRetrieved,
+        requestId: request.id,
+        jobId: job.id,
+        found: true,
+      },
+      "job retrieved",
+    );
 
     reply.status(200).send(job);
   });
@@ -214,6 +274,15 @@ export function registerJobRoutes(app: FastifyInstance): void {
 
     const { id } = parsed.data;
 
+    request.log.info(
+      {
+        event: API_EVENTS.jobRetriggerRequested,
+        requestId: request.id,
+        jobId: id,
+      },
+      "job re-trigger requested",
+    );
+
     if (!isValidTransition("DEAD", "QUEUED")) {
       // Defensive: the state machine must permit the re-trigger.
       throw internalError("DEAD -> QUEUED transition is not allowed");
@@ -223,8 +292,26 @@ export function registerJobRoutes(app: FastifyInstance): void {
 
     if (!result.ok) {
       if (result.reason === "not_found") {
+        request.log.info(
+          {
+            event: API_EVENTS.jobRetriggerFailed,
+            requestId: request.id,
+            jobId: id,
+            reason: "not_found",
+          },
+          "job re-trigger failed: job not found",
+        );
         throw notFound(`job ${id} not found`);
       }
+      request.log.info(
+        {
+          event: API_EVENTS.jobRetriggerConflict,
+          requestId: request.id,
+          jobId: id,
+          reason: result.reason,
+        },
+        "job re-trigger conflict: job is not dead",
+      );
       throw conflict(
         `job ${id} is not eligible for retry: only DEAD jobs can be manually re-triggered`,
       );
@@ -248,8 +335,10 @@ export function registerJobRoutes(app: FastifyInstance): void {
 
       request.log.error(
         {
+          event: API_EVENTS.jobRetriggerFailed,
+          requestId: request.id,
           postgresJobId: id,
-          err: error instanceof Error ? error.message : String(error),
+          ...safeError(error),
         },
         "dlq: failed to enqueue re-triggered job, returned it to DEAD",
       );
@@ -258,6 +347,19 @@ export function registerJobRoutes(app: FastifyInstance): void {
         `failed to enqueue re-triggered job ${id}; job returned to DEAD`,
       );
     }
+
+    request.log.info(
+      {
+        event: API_EVENTS.jobRetriggered,
+        requestId: request.id,
+        jobId: result.job.id,
+      },
+      "job re-triggered",
+    );
+
+    // Count only the fully successful re-trigger (DB + BullMQ), not the
+    // attempt (PART 6).
+    safely(() => apiMetrics.jobsRetriggeredTotal.inc());
 
     reply.status(200).send(result.job);
   });

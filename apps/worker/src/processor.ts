@@ -1,4 +1,5 @@
 import type { Job } from "bullmq";
+import type { Logger } from "pino";
 import { eq } from "drizzle-orm";
 import {
   jobs,
@@ -7,14 +8,27 @@ import {
   applyFullJitter,
   calculateExponentialDelayMs,
 } from "@chronoqueue/db";
+import { safeError, safely, WORKER_EVENTS } from "@chronoqueue/observability";
 import { db } from "./db/client.js";
-import { logger } from "./logger.js";
+import { logger as defaultLogger } from "./logger.js";
+import {
+  workerMetrics as defaultWorkerMetrics,
+  type WorkerMetrics,
+} from "./observability.js";
 import { deliverWebhook, WebhookDeliveryError } from "./webhook-delivery.js";
 import { config } from "./config/env.js";
 import { claimJob, renewLease, completeProcessing } from "./lease.js";
 
 export interface WebhookDeliveryJobData {
   jobId: string;
+}
+
+// Test seam: production call sites (BullMQ Worker) pass only `job`; tests
+// inject a capture logger and a fresh metrics registry. Defaults keep the
+// existing behavior unchanged.
+export interface ProcessorDeps {
+  logger?: Logger;
+  workerMetrics?: WorkerMetrics;
 }
 
 // Day 14 DLQ: maps a delivery failure to a compact, queryable diagnosis
@@ -39,6 +53,16 @@ function diagnoseFailure(error: unknown): {
   };
 }
 
+// Operational hostname for logs: the full target URL can carry secrets in
+// query params (e.g. ?token=...), so logs only ever see the hostname.
+function targetHost(targetUrl: string): string {
+  try {
+    return new URL(targetUrl).hostname;
+  } catch {
+    return "[invalid-url]";
+  }
+}
+
 function isWebhookDeliveryJobData(
   data: unknown,
 ): data is WebhookDeliveryJobData {
@@ -57,21 +81,39 @@ function isWebhookDeliveryJobData(
 // it), renewal stops immediately rather than continuing to try. Renewal
 // errors are caught and logged, never thrown, so a transient DB hiccup
 // here cannot crash the process or leave an unhandled rejection.
+//
+// High-frequency by design: renewal logs at DEBUG only (PART 12).
 function startLeaseRenewal(
   jobId: string,
   bullJobId: string | undefined,
   leaseToken: string,
+  logger: Logger,
 ): NodeJS.Timeout {
   const timer = setInterval(() => {
     renewLease(jobId, leaseToken)
       .then((renewed) => {
         if (renewed) {
-          logger.debug({ bullJobId, postgresJobId: jobId }, "lease renewed");
+          logger.debug(
+            {
+              event: WORKER_EVENTS.leaseLost,
+              leaseRenewed: true,
+              bullJobId,
+              jobId,
+            },
+            "lease renewed",
+          );
           return;
         }
 
+        // The token no longer owns the row — a newer attempt claimed it.
+        // leaseOwned:false (never the token value) is the safe diagnostic.
         logger.warn(
-          { bullJobId, postgresJobId: jobId },
+          {
+            event: WORKER_EVENTS.leaseLost,
+            leaseOwned: false,
+            bullJobId,
+            jobId,
+          },
           "lease renewal fenced out — this worker no longer owns the processing attempt, stopping renewal",
         );
         clearInterval(timer);
@@ -79,9 +121,10 @@ function startLeaseRenewal(
       .catch((error) => {
         logger.error(
           {
+            event: WORKER_EVENTS.leaseLost,
             bullJobId,
-            postgresJobId: jobId,
-            err: error instanceof Error ? error.message : String(error),
+            jobId,
+            ...safeError(error),
           },
           "lease renewal failed",
         );
@@ -91,7 +134,13 @@ function startLeaseRenewal(
   return timer;
 }
 
-export async function processWebhookDeliveryJob(job: Job): Promise<void> {
+export async function processWebhookDeliveryJob(
+  job: Job,
+  deps: ProcessorDeps = {},
+): Promise<void> {
+  const logger = deps.logger ?? defaultLogger;
+  const metrics = deps.workerMetrics ?? defaultWorkerMetrics;
+
   if (!isWebhookDeliveryJobData(job.data)) {
     throw new Error(
       `Job ${job.id} has invalid data — expected { jobId: string }, got ${JSON.stringify(job.data)}`,
@@ -101,7 +150,11 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
   const { jobId } = job.data;
 
   logger.info(
-    { bullJobId: job.id, postgresJobId: jobId },
+    {
+      event: WORKER_EVENTS.jobProcessingStarted,
+      bullJobId: job.id,
+      jobId,
+    },
     "processing webhook delivery job",
   );
 
@@ -113,7 +166,11 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
 
   if (!businessJob) {
     logger.error(
-      { bullJobId: job.id, postgresJobId: jobId },
+      {
+        event: WORKER_EVENTS.webhookFailed,
+        bullJobId: job.id,
+        jobId,
+      },
       "postgresql job not found for queued webhook delivery job",
     );
     throw new Error(
@@ -121,21 +178,21 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
     );
   }
 
-  logger.info(
-    {
-      bullJobId: job.id,
-      postgresJobId: businessJob.id,
-      status: businessJob.status,
-    },
-    "loaded postgresql job successfully",
-  );
-
   const claimResult = await claimJob(jobId);
 
   if (!claimResult) {
-    logger.error(
-      { bullJobId: job.id, postgresJobId: jobId, status: businessJob.status },
-      "could not claim postgresql job for processing — unexpected status",
+    // Another worker (or a previous attempt of this one) already owns or
+    // finished this job. Not a failure — at-least-once coordination.
+    safely(() => metrics.workerClaimConflictsTotal.inc());
+    logger.warn(
+      {
+        event: WORKER_EVENTS.jobClaimed,
+        claimed: false,
+        bullJobId: job.id,
+        jobId,
+        status: businessJob.status,
+      },
+      "could not claim postgresql job for processing — already owned or finished",
     );
     throw new Error(
       `PostgreSQL job ${jobId} could not be claimed for processing (status was ${businessJob.status})`,
@@ -143,18 +200,52 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
   }
 
   const { job: claimed, leaseToken } = claimResult;
+  const attempt = claimed.attempts + 1;
 
-  const startedAt = Date.now();
-  const renewalTimer = startLeaseRenewal(jobId, job.id, leaseToken);
+  logger.info(
+    {
+      event: WORKER_EVENTS.jobClaimed,
+      claimed: true,
+      leaseOwned: true,
+      bullJobId: job.id,
+      jobId,
+      attempt,
+    },
+    "claimed postgresql job for processing",
+  );
+
+  // Monotonic clock for durations (PART 7): Date.now() can jump with NTP;
+  // performance.now() cannot. Processing duration starts at successful
+  // claim — queue wait time is deliberately excluded.
+  const processingStart = performance.now();
+  const renewalTimer = startLeaseRenewal(jobId, job.id, leaseToken, logger);
 
   try {
     try {
+      logger.info(
+        {
+          event: WORKER_EVENTS.webhookStarted,
+          bullJobId: job.id,
+          jobId,
+          attempt,
+          targetHost: targetHost(claimed.targetUrl),
+        },
+        "starting webhook delivery attempt",
+      );
+
+      const webhookStart = performance.now();
+      safely(() => metrics.webhookRequestsTotal.inc());
       const statusCode = await deliverWebhook(
         claimed.targetUrl,
         claimed.payload,
       );
-      const durationMs = Date.now() - startedAt;
-      const attempts = claimed.attempts + 1;
+      const webhookDurationSec = (performance.now() - webhookStart) / 1000;
+      const durationMs = Math.round(performance.now() - processingStart);
+      safely(() =>
+        metrics.webhookDurationSeconds.observe(webhookDurationSec, {
+          outcome: "success",
+        }),
+      );
 
       if (!isValidTransition("PROCESSING", "SUCCEEDED")) {
         throw new Error("Illegal state transition PROCESSING -> SUCCEEDED");
@@ -162,7 +253,7 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
 
       const updated = await completeProcessing(jobId, leaseToken, {
         status: "SUCCEEDED",
-        attempts,
+        attempts: attempt,
         nextAttemptAt: null,
         // A re-triggered job may carry failure diagnosis from its earlier
         // death; a fresh success clears it.
@@ -171,40 +262,58 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
       });
 
       if (!updated) {
+        // Fenced out: the guarded transition did NOT succeed, so no
+        // success metric is recorded (PART 6 — metrics follow transitions).
         logger.warn(
-          { bullJobId: job.id, postgresJobId: businessJob.id },
+          {
+            event: WORKER_EVENTS.leaseLost,
+            leaseOwned: false,
+            bullJobId: job.id,
+            jobId,
+            attempt,
+          },
           "fenced out before recording success — a newer processing attempt now owns this job; discarding this result",
         );
+      } else {
+        safely(() => {
+          metrics.jobsSucceededTotal.inc();
+          metrics.jobProcessingDurationSeconds.observe(
+            (performance.now() - processingStart) / 1000,
+            { outcome: "succeeded" },
+          );
+        });
       }
 
       logger.info(
         {
+          event: WORKER_EVENTS.webhookSucceeded,
           bullJobId: job.id,
-          postgresJobId: businessJob.id,
-          targetUrl: claimed.targetUrl,
+          jobId,
+          attempt,
+          targetHost: targetHost(claimed.targetUrl),
           statusCode,
           durationMs,
-          attempts,
+          recorded: updated,
         },
         "webhook delivered successfully",
       );
     } catch (error) {
-      const durationMs = Date.now() - startedAt;
-      const attempts = claimed.attempts + 1;
+      const durationMs = Math.round(performance.now() - processingStart);
 
       const retryable =
         error instanceof WebhookDeliveryError ? error.retryable : false;
       const statusCode =
         error instanceof WebhookDeliveryError ? error.statusCode : undefined;
-      const willRetry = retryable && attempts < claimed.maxAttempts;
+      const willRetry = retryable && attempt < claimed.maxAttempts;
       const nextStatus: JobStatus = willRetry ? "RETRYING" : "DEAD";
+      const { lastErrorCode, lastErrorMessage } = diagnoseFailure(error);
 
       let nextAttemptAt: Date | null = null;
       let exponentialDelayMs: number | undefined;
       let jitteredDelayMs: number | undefined;
 
       if (willRetry) {
-        exponentialDelayMs = calculateExponentialDelayMs(attempts, {
+        exponentialDelayMs = calculateExponentialDelayMs(attempt, {
           baseDelayMs: config.RETRY_BASE_DELAY_MS,
           maxDelayMs: config.RETRY_MAX_DELAY_MS,
         });
@@ -213,10 +322,9 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
       }
 
       if (isValidTransition("PROCESSING", nextStatus)) {
-        const { lastErrorCode, lastErrorMessage } = diagnoseFailure(error);
         const updated = await completeProcessing(jobId, leaseToken, {
           status: nextStatus,
-          attempts,
+          attempts: attempt,
           nextAttemptAt,
           lastErrorCode,
           lastErrorMessage,
@@ -224,37 +332,101 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
 
         if (!updated) {
           logger.warn(
-            { bullJobId: job.id, postgresJobId: businessJob.id, nextStatus },
+            {
+              event: WORKER_EVENTS.leaseLost,
+              leaseOwned: false,
+              bullJobId: job.id,
+              jobId,
+              attempt,
+              nextStatus,
+            },
             "fenced out before recording failure outcome — a newer processing attempt now owns this job; discarding this result",
           );
+        } else {
+          // Metrics follow the guarded transition, not the attempt
+          // (PART 6): only a successful PG write counts.
+          safely(() => {
+            if (nextStatus === "RETRYING") {
+              metrics.jobsRetriedTotal.inc({ source: "worker" });
+            } else {
+              metrics.jobsDeadTotal.inc({ source: "worker" });
+            }
+            metrics.webhookFailuresTotal.inc({ error_code: lastErrorCode });
+            metrics.webhookDurationSeconds.observe(durationMs / 1000, {
+              outcome: "failure",
+            });
+            metrics.jobProcessingDurationSeconds.observe(durationMs / 1000, {
+              outcome: nextStatus === "RETRYING" ? "retrying" : "dead",
+            });
+          });
         }
       } else {
         logger.error(
-          { bullJobId: job.id, postgresJobId: businessJob.id, nextStatus },
+          {
+            event: WORKER_EVENTS.webhookFailed,
+            bullJobId: job.id,
+            jobId,
+            attempt,
+            nextStatus,
+          },
           "illegal state transition computed by retry engine — postgresql row not updated",
         );
       }
 
+      // The failure diagnostic: which job, which attempt, why (code),
+      // retryable, how long. No payload, no URL, no raw error dump.
       logger.error(
         {
+          event: WORKER_EVENTS.webhookFailed,
           bullJobId: job.id,
-          postgresJobId: businessJob.id,
-          targetUrl: claimed.targetUrl,
-          durationMs,
-          attempts,
+          jobId,
+          attempt,
           maxAttempts: claimed.maxAttempts,
+          targetHost: targetHost(claimed.targetUrl),
+          errorCode: lastErrorCode,
           retryable,
           statusCode,
           nextStatus,
           exponentialDelayMs,
           jitteredDelayMs,
-          nextAttemptAt,
-          err: error instanceof Error ? error.message : String(error),
+          durationMs,
+          ...safeError(error),
         },
         nextStatus === "RETRYING"
           ? "webhook delivery failed, scheduled for retry"
           : "webhook delivery failed permanently, job marked dead",
       );
+
+      if (willRetry) {
+        logger.info(
+          {
+            event: WORKER_EVENTS.jobRetryScheduled,
+            bullJobId: job.id,
+            jobId,
+            attempt,
+            nextAttemptAt: nextAttemptAt?.toISOString() ?? null,
+            delayMs: jitteredDelayMs ?? null,
+          },
+          "job scheduled for retry",
+        );
+      } else {
+        // DLQ observability (PART 10): everything needed to answer which
+        // job, which attempt, why it died, and the durable diagnosis.
+        // last_error_code/message remain the durable source in PG.
+        logger.warn(
+          {
+            event: WORKER_EVENTS.jobMarkedDead,
+            bullJobId: job.id,
+            jobId,
+            attempt,
+            maxAttempts: claimed.maxAttempts,
+            errorCode: lastErrorCode,
+            errorMessage: lastErrorMessage,
+            durationMs,
+          },
+          "job marked dead",
+        );
+      }
 
       throw error;
     }

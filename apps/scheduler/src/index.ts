@@ -1,3 +1,4 @@
+import { SCHEDULER_EVENTS, safeError } from "@chronoqueue/observability";
 import { logger } from "./logger.js";
 import { config } from "./config/env.js";
 import { runSchedulerPoll } from "./scheduler.js";
@@ -18,7 +19,11 @@ async function runCycle(): Promise<void> {
     await recoverStaleJobs();
   } catch (error) {
     logger.error(
-      { err: error instanceof Error ? error.message : String(error) },
+      {
+        event: SCHEDULER_EVENTS.expiredLeaseRecovered,
+        recoveryFailed: true,
+        ...safeError(error),
+      },
       "stale job recovery failed",
     );
   }
@@ -27,7 +32,11 @@ async function runCycle(): Promise<void> {
     await runSchedulerPoll();
   } catch (error) {
     logger.error(
-      { err: error instanceof Error ? error.message : String(error) },
+      {
+        event: SCHEDULER_EVENTS.schedulerPollCompleted,
+        pollFailed: true,
+        ...safeError(error),
+      },
       "scheduler poll failed",
     );
   }
@@ -50,6 +59,7 @@ async function loop(): Promise<void> {
 
 logger.info(
   {
+    event: SCHEDULER_EVENTS.schedulerStarted,
     pollIntervalMs: config.SCHEDULER_POLL_INTERVAL_MS,
     batchSize: config.SCHEDULER_BATCH_SIZE,
   },
@@ -64,7 +74,10 @@ async function shutdown(signal: string): Promise<void> {
   }
   shuttingDown = true;
 
-  logger.info({ signal }, "shutting down scheduler");
+  logger.info(
+    { event: SCHEDULER_EVENTS.schedulerShutdown, signal },
+    "shutting down scheduler",
+  );
 
   if (currentPollPromise) {
     await currentPollPromise;
@@ -75,7 +88,10 @@ async function shutdown(signal: string): Promise<void> {
   await connection.quit();
   await pool.end();
 
-  logger.info("scheduler shutdown complete");
+  logger.info(
+    { event: SCHEDULER_EVENTS.schedulerShutdown },
+    "scheduler shutdown complete",
+  );
   process.exit(0);
 }
 

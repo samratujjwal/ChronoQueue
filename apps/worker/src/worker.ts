@@ -4,7 +4,7 @@ import { processWebhookDeliveryJob } from "./processor.js";
 
 export const worker = new Worker(
   "webhook-delivery",
-  processWebhookDeliveryJob,
+  (job) => processWebhookDeliveryJob(job),
   {
     connection,
   },
