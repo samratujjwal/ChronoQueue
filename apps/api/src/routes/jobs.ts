@@ -1,8 +1,17 @@
 import type { FastifyError, FastifyInstance } from "fastify";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { jobs } from "@chronoqueue/db";
+import {
+  DLQ_PAGE_SIZE_DEFAULT,
+  DLQ_PAGE_SIZE_MAX,
+  getJobById,
+  isValidTransition,
+  jobs,
+  listDeadJobs,
+  retriggerDeadJob,
+} from "@chronoqueue/db";
+import { enqueueRetriggeredJob } from "../queue/webhook-producer.js";
 
 const createJobBodySchema = z.object({
   type: z.literal("WEBHOOK"),
@@ -21,9 +30,45 @@ const RETURNING_COLUMNS = {
   createdAt: jobs.createdAt,
 };
 
+// Full diagnostic view for the DLQ (Day 14): everything an operator needs
+// to decide whether a dead job is worth re-triggering.
+const DLQ_JOB_COLUMNS = {
+  id: jobs.id,
+  type: jobs.type,
+  status: jobs.status,
+  targetUrl: jobs.targetUrl,
+  payload: jobs.payload,
+  attempts: jobs.attempts,
+  maxAttempts: jobs.maxAttempts,
+  scheduledAt: jobs.scheduledAt,
+  nextAttemptAt: jobs.nextAttemptAt,
+  lastErrorCode: jobs.lastErrorCode,
+  lastErrorMessage: jobs.lastErrorMessage,
+  createdAt: jobs.createdAt,
+  updatedAt: jobs.updatedAt,
+};
+
 function badRequest(message: string): FastifyError {
   const error = new Error(message) as FastifyError;
   error.statusCode = 400;
+  return error;
+}
+
+function notFound(message: string): FastifyError {
+  const error = new Error(message) as FastifyError;
+  error.statusCode = 404;
+  return error;
+}
+
+function conflict(message: string): FastifyError {
+  const error = new Error(message) as FastifyError;
+  error.statusCode = 409;
+  return error;
+}
+
+function internalError(message: string): FastifyError {
+  const error = new Error(message) as FastifyError;
+  error.statusCode = 500;
   return error;
 }
 
@@ -111,5 +156,109 @@ export function registerJobRoutes(app: FastifyInstance): void {
 
       reply.status(200).send(existing);
     }
+  });
+
+  // NOTE: /jobs/dead is registered before /jobs/:id. Fastify prioritises
+  // static segments over parameters anyway, but explicit ordering keeps
+  // the intent obvious.
+  app.get("/jobs/dead", async (request, reply) => {
+    const parsed = z
+      .object({
+        page: z.coerce.number().int().min(1).default(1),
+        pageSize: z.coerce
+          .number()
+          .int()
+          .min(1)
+          .max(DLQ_PAGE_SIZE_MAX)
+          .default(DLQ_PAGE_SIZE_DEFAULT),
+      })
+      .safeParse(request.query);
+
+    if (!parsed.success) {
+      const message = parsed.error.issues
+        .map((issue) => `${issue.path.join(".") || "query"}: ${issue.message}`)
+        .join("; ");
+      throw badRequest(message);
+    }
+
+    const page = await listDeadJobs(db, parsed.data);
+    reply.status(200).send(page);
+  });
+
+  app.get("/jobs/:id", async (request, reply) => {
+    const parsed = z
+      .object({ id: z.string().uuid() })
+      .safeParse(request.params);
+
+    if (!parsed.success) {
+      throw badRequest("id: must be a valid UUID");
+    }
+
+    const job = await getJobById(db, parsed.data.id);
+
+    if (!job) {
+      throw notFound(`job ${parsed.data.id} not found`);
+    }
+
+    reply.status(200).send(job);
+  });
+
+  app.post("/jobs/:id/retry", async (request, reply) => {
+    const parsed = z
+      .object({ id: z.string().uuid() })
+      .safeParse(request.params);
+
+    if (!parsed.success) {
+      throw badRequest("id: must be a valid UUID");
+    }
+
+    const { id } = parsed.data;
+
+    if (!isValidTransition("DEAD", "QUEUED")) {
+      // Defensive: the state machine must permit the re-trigger.
+      throw internalError("DEAD -> QUEUED transition is not allowed");
+    }
+
+    const result = await retriggerDeadJob(db, id);
+
+    if (!result.ok) {
+      if (result.reason === "not_found") {
+        throw notFound(`job ${id} not found`);
+      }
+      throw conflict(
+        `job ${id} is not eligible for retry: only DEAD jobs can be manually re-triggered`,
+      );
+    }
+
+    // The DB transition above is durable; the BullMQ message is
+    // coordination. Enqueue AFTER the guarded update so a crash between
+    // the two can only strand a QUEUED row (the scheduler's known
+    // dual-write gap) — never lose an operator's re-trigger silently.
+    try {
+      await enqueueRetriggeredJob(id);
+    } catch (error) {
+      // Enqueue failed: compensate by moving the row back to DEAD via a
+      // guarded update, so the job is NOT left stranded in QUEUED with no
+      // BullMQ message. The 500 tells the operator to retry; the job's
+      // history (attempts, failure diagnosis) is untouched.
+      await db
+        .update(jobs)
+        .set({ status: "DEAD", updatedAt: new Date() })
+        .where(and(eq(jobs.id, id), eq(jobs.status, "QUEUED")));
+
+      request.log.error(
+        {
+          postgresJobId: id,
+          err: error instanceof Error ? error.message : String(error),
+        },
+        "dlq: failed to enqueue re-triggered job, returned it to DEAD",
+      );
+
+      throw internalError(
+        `failed to enqueue re-triggered job ${id}; job returned to DEAD`,
+      );
+    }
+
+    reply.status(200).send(result.job);
   });
 }

@@ -8,7 +8,10 @@ const transitions: Record<JobStatus, readonly JobStatus[]> = {
   PROCESSING: ["SUCCEEDED", "RETRYING", "DEAD"],
   RETRYING: ["QUEUED", "DEAD"],
   SUCCEEDED: [],
-  DEAD: [],
+  // DEAD is re-enterable exactly once per manual re-trigger (Day 14 DLQ):
+  // a guarded DB update moves DEAD -> QUEUED, after which the normal
+  // Worker claim path takes over with a fresh leaseToken.
+  DEAD: ["QUEUED"],
 };
 
 export function isValidTransition(from: JobStatus, to: JobStatus): boolean {

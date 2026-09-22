@@ -63,6 +63,10 @@ export async function renewLease(
 // SUCCEEDED, RETRYING, and DEAD outcomes alike — an old/stale worker's
 // token can never complete a newer processing attempt. Always clears the
 // lease fields on success.
+//
+// Day 14: also persists the latest failure diagnosis (lastErrorCode /
+// lastErrorMessage) on RETRYING/DEAD, and clears it on SUCCEEDED. The
+// fencing WHERE clause is unchanged.
 export async function completeProcessing(
   jobId: string,
   leaseToken: string,
@@ -70,6 +74,8 @@ export async function completeProcessing(
     status: JobStatus;
     attempts: number;
     nextAttemptAt: Date | null;
+    lastErrorCode?: string | null;
+    lastErrorMessage?: string | null;
   },
 ): Promise<boolean> {
   const [updated] = await db
@@ -78,6 +84,8 @@ export async function completeProcessing(
       status: update.status,
       attempts: update.attempts,
       nextAttemptAt: update.nextAttemptAt,
+      lastErrorCode: update.lastErrorCode ?? null,
+      lastErrorMessage: update.lastErrorMessage ?? null,
       leaseUntil: null,
       leaseToken: null,
       updatedAt: new Date(),

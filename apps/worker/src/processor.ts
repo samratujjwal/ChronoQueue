@@ -17,6 +17,28 @@ export interface WebhookDeliveryJobData {
   jobId: string;
 }
 
+// Day 14 DLQ: maps a delivery failure to a compact, queryable diagnosis
+// that is persisted on the job row (last_error_code / last_error_message)
+// so the dead-letter queue can show WHY a job died without log access.
+function diagnoseFailure(error: unknown): {
+  lastErrorCode: string;
+  lastErrorMessage: string;
+} {
+  if (error instanceof WebhookDeliveryError) {
+    const code =
+      error.statusCode !== undefined
+        ? `HTTP_${error.statusCode}`
+        : error.kind === "timeout"
+          ? "TIMEOUT"
+          : "NETWORK_ERROR";
+    return { lastErrorCode: code, lastErrorMessage: error.message };
+  }
+  return {
+    lastErrorCode: "UNKNOWN_ERROR",
+    lastErrorMessage: error instanceof Error ? error.message : String(error),
+  };
+}
+
 function isWebhookDeliveryJobData(
   data: unknown,
 ): data is WebhookDeliveryJobData {
@@ -142,6 +164,10 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
         status: "SUCCEEDED",
         attempts,
         nextAttemptAt: null,
+        // A re-triggered job may carry failure diagnosis from its earlier
+        // death; a fresh success clears it.
+        lastErrorCode: null,
+        lastErrorMessage: null,
       });
 
       if (!updated) {
@@ -187,10 +213,13 @@ export async function processWebhookDeliveryJob(job: Job): Promise<void> {
       }
 
       if (isValidTransition("PROCESSING", nextStatus)) {
+        const { lastErrorCode, lastErrorMessage } = diagnoseFailure(error);
         const updated = await completeProcessing(jobId, leaseToken, {
           status: nextStatus,
           attempts,
           nextAttemptAt,
+          lastErrorCode,
+          lastErrorMessage,
         });
 
         if (!updated) {

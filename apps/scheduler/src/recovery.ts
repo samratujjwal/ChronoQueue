@@ -92,6 +92,11 @@ export async function recoverStaleJobs(): Promise<RecoveryResult> {
           leaseUntil: null,
           leaseToken: null,
           nextAttemptAt,
+          // Day 14 DLQ: a crash-recovered job carries no webhook error, but
+          // the DLQ still needs to say why it died / was re-driven.
+          lastErrorCode: "WORKER_CRASH",
+          lastErrorMessage:
+            "Worker lease expired while PROCESSING — presumed crashed; recovered by scheduler",
           updatedAt: new Date(),
         })
         .where(and(eq(jobs.id, job.id), staleCondition(new Date())))
