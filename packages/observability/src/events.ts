@@ -7,7 +7,11 @@ export const API_EVENTS = {
   jobCreated: "job_created",
   jobCreationIdempotentHit: "job_creation_idempotent_hit",
   jobRetrieved: "job_retrieved",
+  // deadJobsListed: "dead_jobs_listed",
   deadJobsListed: "dead_jobs_listed",
+  jobsListed: "jobs_listed",
+  jobStatsRetrieved: "job_stats_retrieved",
+
   jobRetriggerRequested: "job_retrigger_requested",
   jobRetriggered: "job_retriggered",
   jobRetriggerConflict: "job_retrigger_conflict",

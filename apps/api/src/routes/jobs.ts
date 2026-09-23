@@ -5,12 +5,18 @@ import { db } from "../db/client.js";
 import {
   DLQ_PAGE_SIZE_DEFAULT,
   DLQ_PAGE_SIZE_MAX,
+  JOBS_PAGE_SIZE_DEFAULT,
+  JOBS_PAGE_SIZE_MAX,
   getJobById,
+  getJobStats,
   isValidTransition,
   jobs,
+  jobStatusEnum,
   listDeadJobs,
+  listJobs,
   retriggerDeadJob,
 } from "@chronoqueue/db";
+
 import { API_EVENTS, safeError, safely } from "@chronoqueue/observability";
 import { enqueueRetriggeredJob } from "../queue/webhook-producer.js";
 import { apiMetrics } from "../observability.js";
@@ -187,10 +193,61 @@ export function registerJobRoutes(app: FastifyInstance): void {
     }
   });
 
-  // NOTE: /jobs/dead is registered before /jobs/:id. Fastify prioritises
-  // static segments over parameters anyway, but explicit ordering keeps
-  // the intent obvious.
-  app.get("/jobs/dead", async (request, reply) => {
+ app.get("/jobs/stats", async (request, reply) => {
+  const stats = await getJobStats(db);
+
+  request.log.info(
+    {
+      event: API_EVENTS.jobStatsRetrieved,
+      requestId: request.id,
+      total: stats.total,
+    },
+    "job stats retrieved",
+  );
+
+  reply.status(200).send(stats);
+});
+
+app.get("/jobs", async (request, reply) => {
+  const parsed = z
+    .object({
+      page: z.coerce.number().int().min(1).default(1),
+      pageSize: z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(JOBS_PAGE_SIZE_MAX)
+        .default(JOBS_PAGE_SIZE_DEFAULT),
+      status: z.enum(jobStatusEnum.enumValues).optional(),
+    })
+    .safeParse(request.query);
+
+  if (!parsed.success) {
+    const message = parsed.error.issues
+      .map((issue) => `${issue.path.join(".") || "query"}: ${issue.message}`)
+      .join("; ");
+    throw badRequest(message);
+  }
+
+  const page = await listJobs(db, parsed.data);
+
+  request.log.info(
+    {
+      event: API_EVENTS.jobsListed,
+      requestId: request.id,
+      page: parsed.data.page,
+      pageSize: parsed.data.pageSize,
+      status: parsed.data.status ?? "all",
+      total: page.total,
+    },
+    "jobs listed",
+  );
+
+  reply.status(200).send(page);
+});
+
+app.get("/jobs/dead", async (request, reply) => {
+
     const parsed = z
       .object({
         page: z.coerce.number().int().min(1).default(1),
