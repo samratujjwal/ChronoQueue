@@ -1,0 +1,25 @@
+{
+  "dependencies": {
+    "@chronoqueue/db": "*",
+    "drizzle-orm": "^0.45.2"
+  },
+  "description": "Test-only helpers for Day 17 load testing and failure engineering. Never imported by production code.",
+  "devDependencies": {
+    "bullmq": "^6.3.6",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  },
+  "main": "./dist/index.js",
+  "name": "@chronoqueue/testkit",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "version": "1.0.0"
+}
